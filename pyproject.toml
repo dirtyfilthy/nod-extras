@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nod-extras"
+version = "0.1.0"
+description = "The parts of Nod that don't belong in the core: background jobs, subagents, skills."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "alhazred" }]
+dependencies = [
+    "nod",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv.sources]
+nod = { path = "../nod", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nod_extras"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

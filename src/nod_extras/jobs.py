@@ -19,6 +19,7 @@ The design is `docs/background-jobs.md` in the `nod` repo.
 from __future__ import annotations
 
 import atexit
+import fcntl
 import json
 import os
 import re
@@ -156,6 +157,10 @@ class Jobs:
         self._jobs: dict[str, dict[int, Job]] = {}
         self._next_ids: dict[str, int] = {}
         self._closed = False
+        # Held for as long as this process lives. The record names it, so a
+        # later Nod can tell whether the one that started a job is still
+        # running without trusting a pid, which the OS reuses.
+        self._owner_name, self._owner_fd = self._claim_owner_lock()
         self._recover()
         self._reaper = threading.Thread(target=self._reap_loop, name="nod-jobs", daemon=True)
         self._reaper.start()
@@ -227,6 +232,7 @@ class Jobs:
                     "started": job.started,
                     "deadline": job.deadline,
                     "nod_pid": os.getpid(),
+                    "nod_lock": self._owner_name,
                     "ref": job.ref,
                 },
             )
@@ -315,6 +321,12 @@ class Jobs:
             atexit.unregister(self.shutdown)
         except Exception:  # noqa: BLE001
             pass
+        # Nothing of ours is left running, so nothing needs to find us lost.
+        try:
+            os.close(self._owner_fd)
+            (self.jobs_dir / "owners" / self._owner_name).unlink()
+        except OSError:
+            pass
 
     @staticmethod
     def _poll_quietly(job: Job) -> JobResult | None:
@@ -395,11 +407,46 @@ class Jobs:
             f.write(json.dumps(entry, separators=(",", ":")))
             f.write("\n")
 
+    def _claim_owner_lock(self) -> tuple[str, int]:
+        owners = self.jobs_dir / "owners"
+        owners.mkdir(parents=True, exist_ok=True)
+        name = f"{os.getpid()}-{int(time.time())}"
+        fd = os.open(owners / name, os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return name, fd
+
+    def _owner_alive(self, entry: dict[str, Any]) -> bool:
+        """Whether the Nod that started this job is still running.
+
+        Its lock file is held with `flock` for as long as it lives and the OS
+        drops the lock when it dies, so a recycled pid can't pass for a live
+        owner. Records without a lock name (written before locks existed)
+        fall back to pid liveness.
+        """
+
+        name = entry.get("nod_lock")
+        if not isinstance(name, str) or not re.fullmatch(r"[0-9A-Za-z._-]+", name):
+            pid = int(entry.get("nod_pid") or 0)
+            return pid == os.getpid() or (pid > 0 and _pid_alive(pid))
+        if name == self._owner_name:
+            return True
+        path = self.jobs_dir / "owners" / name
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError:
+            return False  # no lock file: the owner is gone and already cleaned up
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True  # someone holds it: the owner is alive
+        finally:
+            os.close(fd)  # also releases the lock if we got it
+        path.unlink(missing_ok=True)  # we got it, so the owner is dead
+        return False
+
     def _recover(self) -> None:
         """Report jobs a dead Nod left running as `lost`, and continue its ids."""
 
-        if not self.jobs_dir.is_dir():
-            return
         for record in sorted(self.jobs_dir.glob("*/jobs.jsonl")):
             started: dict[int, dict[str, Any]] = {}
             finished: set[int] = set()
@@ -425,9 +472,9 @@ class Jobs:
             for job_id, entry in sorted(started.items()):
                 if job_id in finished:
                     continue
-                owner = int(entry.get("nod_pid") or 0)
-                if owner == os.getpid() or (owner and _pid_alive(owner)):
+                if self._owner_alive(entry):
                     continue  # another live Nod owns it; not ours to report
+                owner = int(entry.get("nod_pid") or 0)
                 self.inbox.post(session_id, self._lost_text(entry, owner))
                 self._record(session_id, {"id": job_id, "status": "lost"})
 

@@ -274,6 +274,47 @@ def test_lost_jobs_are_reported_on_startup_and_ids_continue(tmp_path):
         again.shutdown()
 
 
+def test_recycled_pid_does_not_hide_a_lost_job(tmp_path):
+    import fcntl
+
+    owners = tmp_path / "owners"
+    owners.mkdir()
+    # A record whose owner is dead and cleaned up, one whose owner is dead but
+    # left its lock file, and one whose owner is alive and holding its lock.
+    # Every one names our own pid, as if the OS had recycled it.
+    (owners / "stale").touch()
+    held = (owners / "alive").open("w")
+    fcntl.flock(held, fcntl.LOCK_EX)
+    record = tmp_path / "s" / "jobs.jsonl"
+    record.parent.mkdir()
+    lines = [
+        {"id": 1, "kind": "shell", "session": "s", "description": "command: a", "started": 1.0,
+         "deadline": 2.0, "nod_pid": os.getpid(), "nod_lock": "gone", "ref": {"pid": 424242}},
+        {"id": 2, "kind": "shell", "session": "s", "description": "command: b", "started": 1.0,
+         "deadline": 2.0, "nod_pid": os.getpid(), "nod_lock": "stale", "ref": {"pid": 424243}},
+        {"id": 3, "kind": "shell", "session": "s", "description": "command: c", "started": 1.0,
+         "deadline": 2.0, "nod_pid": os.getpid(), "nod_lock": "alive", "ref": {"pid": 424244}},
+    ]
+    record.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    inbox = InMemoryInbox()
+    jobs = Jobs(inbox, [ShellJobKind()], jobs_dir=tmp_path, poll_interval=0.02)
+    try:
+        events = [e.text for e in inbox.pending("s")]
+        assert [t.split("\n")[0] for t in events] == [
+            "<job-finished id=1 kind=shell status=lost duration=unknown>",
+            "<job-finished id=2 kind=shell status=lost duration=unknown>",
+        ]
+        assert f"lost: Nod (pid {os.getpid()}) exited" in events[0]
+        assert not (owners / "stale").exists()  # a dead owner's lock file is cleaned up
+        assert (owners / "alive").exists()
+        assert (owners / jobs._owner_name).exists()
+    finally:
+        held.close()
+        jobs.shutdown()
+    assert not (owners / jobs._owner_name).exists()  # a clean exit removes ours
+
+
 def _dead_pid():
     import subprocess
 
@@ -287,6 +328,13 @@ def test_record_has_start_and_finish_lines(jobs, inbox, tmp_path):
     _wait_event(inbox)
     lines = [json.loads(l) for l in (tmp_path / "s" / "jobs.jsonl").read_text().splitlines()]
     assert lines[0]["id"] == 1 and lines[0]["kind"] == "shell" and lines[0]["nod_pid"] == os.getpid()
+    # The record names our lock file, and we hold it.
+    import fcntl
+
+    assert lines[0]["nod_lock"] == jobs._owner_name
+    with (tmp_path / "owners" / jobs._owner_name).open() as f:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
     assert "pid" in lines[0]["ref"] and lines[0]["ref"]["log"].endswith("/s/1.log")
     assert lines[1] == {"id": 1, "status": "done"}
 

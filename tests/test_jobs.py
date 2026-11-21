@@ -315,6 +315,34 @@ def test_recycled_pid_does_not_hide_a_lost_job(tmp_path):
     assert not (owners / jobs._owner_name).exists()  # a clean exit removes ours
 
 
+def test_two_jobs_in_one_process_do_not_wait_on_each_other(tmp_path):
+    # Each takes a lock file of its own. They used to share a name when built
+    # in the same second, and the second then hung on the first one's lock.
+    first = Jobs(InMemoryInbox(), [ShellJobKind()], jobs_dir=tmp_path, poll_interval=0.02)
+    second = Jobs(InMemoryInbox(), [ShellJobKind()], jobs_dir=tmp_path, poll_interval=0.02)
+    try:
+        assert first._owner_name != second._owner_name
+    finally:
+        first.shutdown()
+        second.shutdown()
+    assert list((tmp_path / "owners").iterdir()) == []
+
+
+def test_a_job_cancelled_by_shutdown_is_not_reported_lost(tmp_path):
+    jobs = Jobs(InMemoryInbox(), [ShellJobKind()], jobs_dir=tmp_path, poll_interval=0.02)
+    jobs.start("shell", "s", description="d", command="sleep 30")
+    jobs.shutdown()
+    lines = [json.loads(l) for l in (tmp_path / "s" / "jobs.jsonl").read_text().splitlines()]
+    assert lines[1:] == [{"id": 1, "status": "cancelled"}]
+
+    inbox = InMemoryInbox()
+    again = Jobs(inbox, [ShellJobKind()], jobs_dir=tmp_path, poll_interval=0.02)
+    try:
+        assert inbox.pending("s") == []
+    finally:
+        again.shutdown()
+
+
 def _dead_pid():
     import subprocess
 

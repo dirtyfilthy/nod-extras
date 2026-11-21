@@ -27,6 +27,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -313,11 +314,15 @@ class Jobs:
                 job.handle.cancel("cancelled")
             except Exception:  # noqa: BLE001 - best effort on the way out
                 pass
+        # The reaper stops once `_closed` is set; wait for it, so it and the
+        # loop below never both record the same job.
+        if threading.current_thread() is not self._reaper:
+            self._reaper.join(timeout=1.0)
         # Give the kinds time to escalate (SIGTERM, then SIGKILL) so nothing
         # we started outlives us when we exit normally.
         end = time.monotonic() + grace
         while running and time.monotonic() < end:
-            running = [j for j in running if self._poll_quietly(j) is None]
+            running = [j for j in running if not self._record_if_ended(j)]
             if running:
                 time.sleep(0.1)
         try:
@@ -330,6 +335,22 @@ class Jobs:
             (self.jobs_dir / "owners" / self._owner_name).unlink()
         except OSError:
             pass
+
+    def _record_if_ended(self, job: Job) -> bool:
+        """During shutdown: write an ended job's status to the record.
+
+        Without the line, the next Nod to start on this `jobs_dir` would
+        report the job as lost, though we saw it end.
+        """
+
+        result = self._poll_quietly(job)
+        if result is None:
+            return False
+        with self._lock:
+            if job.result is None:
+                job.result = result
+                self._record(job.session_id, {"id": job.id, "status": result.status})
+        return True
 
     @staticmethod
     def _poll_quietly(job: Job) -> JobResult | None:
@@ -413,8 +434,10 @@ class Jobs:
     def _claim_owner_lock(self) -> tuple[str, int]:
         owners = self.jobs_dir / "owners"
         owners.mkdir(parents=True, exist_ok=True)
-        name = f"{os.getpid()}-{int(time.time())}"
-        fd = os.open(owners / name, os.O_RDWR | os.O_CREAT, 0o644)
+        # The random part keeps two Jobs in one process apart: with the same
+        # name, the second would wait forever on the lock the first holds.
+        name = f"{os.getpid()}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        fd = os.open(owners / name, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
         fcntl.flock(fd, fcntl.LOCK_EX)
         return name, fd
 

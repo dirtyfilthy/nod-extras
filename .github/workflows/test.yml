@@ -1,0 +1,24 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      # nod-extras depends on a sibling ../nod checkout (see pyproject.toml).
+      - uses: actions/checkout@v4
+        with:
+          path: nod-extras
+      - uses: actions/checkout@v4
+        with:
+          repository: dirtyfilthy/nod
+          path: nod
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv run --extra dev pytest -q
+        working-directory: nod-extras

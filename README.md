@@ -32,3 +32,13 @@ uv run --extra dev pytest -q
 
 Tests use a scripted provider and short real shell commands; nothing calls a
 model.
+
+## Related repos
+
+- [nod](https://github.com/dirtyfilthy/nod): the thin agent core this plugs into.
+- [nod-poll](https://github.com/dirtyfilthy/nod-poll): a panel-of-models poll built on Nod's one-shot mode.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
